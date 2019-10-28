@@ -523,6 +523,29 @@ def concatenate_sequences(sequences, sequence_durations=None):
   return remove_redundant_data(cat_seq)
 
 
+def repeat_sequence_to_duration(sequence, duration, sequence_duration=None):
+  """Repeat a sequence until it is a given duration, trimming any extra.
+
+  Args:
+    sequence: the sequence to repeat
+    duration: the desired duration
+    sequence_duration: If provided, will be used instead of sequence.total_time
+
+  Returns:
+    The repeated and possibly trimmed sequence.
+  """
+  if not sequence_duration:
+    sequence_duration = sequence.total_time
+  num_repeats = int(math.ceil(duration / sequence_duration))
+  repeated_ns = concatenate_sequences(
+      [sequence] * num_repeats,
+      sequence_durations=[sequence_duration] * num_repeats)
+
+  trimmed = extract_subsequence(repeated_ns, start_time=0, end_time=duration)
+  trimmed.ClearField('subsequence_info')  # Not relevant in this case.
+  return trimmed
+
+
 def expand_section_groups(sequence):
   """Expands a NoteSequence based on its section_groups.
 
@@ -1469,6 +1492,8 @@ def apply_sustain_control_changes(note_sequence, sustain_control_number=64):
   is done on a per instrument basis, so notes are only affected by sustain
   events for the same instrument.
 
+  Drum notes will not be modified.
+
   Args:
     note_sequence: The NoteSequence for which to apply sustain. This object will
       not be modified.
@@ -1493,8 +1518,10 @@ def apply_sustain_control_changes(note_sequence, sustain_control_number=64):
 
   # Sort all note on/off and sustain on/off events.
   events = []
-  events.extend([(note.start_time, _NOTE_ON, note) for note in sequence.notes])
-  events.extend([(note.end_time, _NOTE_OFF, note) for note in sequence.notes])
+  events.extend([(note.start_time, _NOTE_ON, note) for note in sequence.notes
+                 if not note.is_drum])
+  events.extend([(note.end_time, _NOTE_OFF, note) for note in sequence.notes
+                 if not note.is_drum])
 
   for cc in sequence.control_changes:
     if cc.control_number != sustain_control_number:
@@ -1508,9 +1535,9 @@ def apply_sustain_control_changes(note_sequence, sustain_control_number=64):
     elif value < 64:
       events.append((cc.time, _SUSTAIN_OFF, cc))
 
-  # Sort, using the event type constants to ensure the order events are
+  # Sort, using the time and event type constants to ensure the order events are
   # processed.
-  events.sort(key=operator.itemgetter(0))
+  events.sort(key=operator.itemgetter(0, 1))
 
   # Lists of active notes, keyed by instrument.
   active_notes = collections.defaultdict(list)

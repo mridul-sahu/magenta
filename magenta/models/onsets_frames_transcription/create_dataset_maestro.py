@@ -18,16 +18,18 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import collections
 import hashlib
 import os
-import re
 
 import apache_beam as beam
 from apache_beam.metrics import Metrics
 
+from magenta.models.onsets_frames_transcription import audio_label_data_utils
 from magenta.models.onsets_frames_transcription import data
-from magenta.models.onsets_frames_transcription import split_audio_and_label_data
+from magenta.music import audio_io
 from magenta.protobuf import music_pb2
+import numpy as np
 
 import tensorflow as tf
 
@@ -61,7 +63,7 @@ tf.app.flags.DEFINE_boolean(
 
 
 def split_wav(input_example, min_length, max_length, sample_rate,
-              output_directory, process_for_training, load_audio_with_librosa):
+              debug_output_directory, split_example, load_audio_with_librosa):
   """Splits wav and midi files for the dataset."""
   tf.logging.info('Splitting %s',
                   input_example.features.feature['id'].bytes_list.value[0])
@@ -73,8 +75,8 @@ def split_wav(input_example, min_length, max_length, sample_rate,
 
   Metrics.counter('split_wav', 'read_midi_wav_to_split').inc()
 
-  if not process_for_training:
-    split_examples = split_audio_and_label_data.process_record(
+  if not split_example:
+    split_examples = audio_label_data_utils.process_record(
         wav_data,
         ns,
         ns.id,
@@ -88,7 +90,7 @@ def split_wav(input_example, min_length, max_length, sample_rate,
       yield example
   else:
     try:
-      split_examples = split_audio_and_label_data.process_record(
+      split_examples = audio_label_data_utils.process_record(
           wav_data,
           ns,
           ns.id,
@@ -102,7 +104,7 @@ def split_wav(input_example, min_length, max_length, sample_rate,
         yield example
     except AssertionError:
       output_file = 'badexample-' + hashlib.md5(ns.id).hexdigest() + '.proto'
-      output_path = os.path.join(output_directory, output_file)
+      output_path = os.path.join(debug_output_directory, output_file)
       tf.logging.error('Exception processing %s. Writing file to %s', ns.id,
                        output_path)
       with tf.gfile.Open(output_path, 'w') as f:
@@ -114,87 +116,87 @@ def multiply_example(ex, num_times):
   return [ex] * num_times
 
 
-def preprocess_data(input_example, hparams, process_for_training):
+def preprocess_data(
+    input_example, preprocess_example_fn, input_tensors_to_example_fn, hparams,
+    process_for_training):
   """Preprocess example using data.preprocess_data."""
   with tf.Graph().as_default():
-    audio = tf.constant(
-        input_example.features.feature['audio'].bytes_list.value[0])
+    example_proto = tf.constant(input_example.SerializeToString())
 
-    sequence = tf.constant(
-        input_example.features.feature['sequence'].bytes_list.value[0])
-    sequence_id = tf.constant(
-        input_example.features.feature['id'].bytes_list.value[0])
-    velocity_range = tf.constant(
-        input_example.features.feature['velocity_range'].bytes_list.value[0])
-
-    input_tensors = data.preprocess_data(
-        sequence_id, sequence, audio, velocity_range, hparams,
+    input_tensors = preprocess_example_fn(
+        example_proto=example_proto, hparams=hparams,
         is_training=process_for_training)
 
     with tf.Session() as sess:
       preprocessed = sess.run(input_tensors)
 
-  example = tf.train.Example(
-      features=tf.train.Features(
-          feature={
-              'spec':
-                  tf.train.Feature(
-                      float_list=tf.train.FloatList(
-                          value=preprocessed.spec.flatten())),
-              'spectrogram_hash':
-                  tf.train.Feature(
-                      int64_list=tf.train.Int64List(
-                          value=[preprocessed.spectrogram_hash])),
-              'labels':
-                  tf.train.Feature(
-                      float_list=tf.train.FloatList(
-                          value=preprocessed.labels.flatten())),
-              'label_weights':
-                  tf.train.Feature(
-                      float_list=tf.train.FloatList(
-                          value=preprocessed.label_weights.flatten())),
-              'length':
-                  tf.train.Feature(
-                      int64_list=tf.train.Int64List(
-                          value=[preprocessed.length])),
-              'onsets':
-                  tf.train.Feature(
-                      float_list=tf.train.FloatList(
-                          value=preprocessed.onsets.flatten())),
-              'offsets':
-                  tf.train.Feature(
-                      float_list=tf.train.FloatList(
-                          value=preprocessed.offsets.flatten())),
-              'velocities':
-                  tf.train.Feature(
-                      float_list=tf.train.FloatList(
-                          value=preprocessed.velocities.flatten())),
-              'sequence_id':
-                  tf.train.Feature(
-                      bytes_list=tf.train.BytesList(
-                          value=[preprocessed.sequence_id])),
-              'note_sequence':
-                  tf.train.Feature(
-                      bytes_list=tf.train.BytesList(
-                          value=[preprocessed.note_sequence])),
-          }))
+  example = input_tensors_to_example_fn(preprocessed, hparams)
   Metrics.counter('preprocess_data', 'preprocess_example').inc()
   return example
 
 
-def generate_sharded_filenames(filenames):
-  for filename in filenames.split(','):
-    match = re.match(r'^([^@]+)@(\d+)$', filename)
-    if not match:
-      yield filename
+def generate_mixes(val, num_mixes, sourceid_to_exids):
+  """Generate lists of Example IDs to be mixed."""
+  del val
+  rs = np.random.RandomState(seed=0)  # Make the selection deterministic
+  sourceid_to_exids_dict = collections.defaultdict(list)
+  for sourceid, exid in sourceid_to_exids:
+    sourceid_to_exids_dict[sourceid].append(exid)
+  mixes = zip(
+      *[rs.choice(k, num_mixes, replace=True).tolist()
+        for k in sourceid_to_exids_dict.values()])
+  keyed_mixes = dict(enumerate(mixes))
+  exid_to_mixids = collections.defaultdict(list)
+  for mixid, exids in keyed_mixes.items():
+    for exid in exids:
+      exid_to_mixids[exid].append(mixid)
+  return exid_to_mixids
+
+
+def mix_examples(mixid_exs, sample_rate, load_audio_with_librosa):
+  """Mix several Examples together to create a new example."""
+  mixid, exs = mixid_exs
+  del mixid
+
+  example_samples = []
+  example_sequences = []
+
+  for ex in exs:
+    wav_data = ex.features.feature['audio'].bytes_list.value[0]
+    if load_audio_with_librosa:
+      samples = audio_io.wav_data_to_samples_librosa(wav_data, sample_rate)
     else:
-      num_shards = int(match.group(2))
-      base = match.group(1)
-      for i in range(num_shards):
-        yield '{}-{:0=5d}-of-{:0=5d}'.format(base, i, num_shards)
+      samples = audio_io.wav_data_to_samples(wav_data, sample_rate)
+    example_samples.append(samples)
+    ns = music_pb2.NoteSequence.FromString(
+        ex.features.feature['sequence'].bytes_list.value[0])
+    example_sequences.append(ns)
+
+  mixed_samples, mixed_sequence = audio_label_data_utils.mix_sequences(
+      individual_samples=example_samples, sample_rate=sample_rate,
+      individual_sequences=example_sequences)
+
+  mixed_wav_data = audio_io.samples_to_wav_data(mixed_samples, sample_rate)
+
+  mixed_id = '::'.join(['mixed'] + [ns.id for ns in example_sequences])
+  mixed_sequence.id = mixed_id
+  mixed_filename = '::'.join(
+      ['mixed'] + [ns.filename for ns in example_sequences])
+  mixed_sequence.filename = mixed_filename
+
+  examples = list(audio_label_data_utils.process_record(
+      mixed_wav_data,
+      mixed_sequence,
+      mixed_id,
+      min_length=0,
+      max_length=-1,
+      sample_rate=sample_rate))
+  assert len(examples) == 1
+  return examples[0]
 
 
-def pipeline(config_map, dataset_config_map):
+def pipeline(config_map, dataset_config_map, preprocess_example_fn,
+             input_tensors_to_example_fn):
   """Pipeline for dataset creation."""
   tf.flags.mark_flags_as_required(['output_directory'])
 
@@ -228,16 +230,95 @@ def pipeline(config_map, dataset_config_map):
 
   with beam.Pipeline(options=pipeline_options) as p:
     for dataset in datasets:
-      split_p = p | 'tfrecord_list_%s' % dataset.name >> beam.Create(
-          generate_sharded_filenames(dataset.path))
-      split_p |= 'read_tfrecord_%s' % dataset.name >> (
-          beam.io.tfrecordio.ReadAllFromTFRecord(
-              coder=beam.coders.ProtoCoder(tf.train.Example)))
+      if isinstance(dataset.path, (list, tuple)):
+        # If dataset.path is a list, then it's a list of sources to mix together
+        # to form new examples. First, do the mixing, then pass the results to
+        # the rest of the pipeline.
+        id_exs = []
+        sourceid_to_exids = []
+        for source_id, stem_path in enumerate(dataset.path):
+          if dataset.num_mixes is None:
+            raise ValueError(
+                'If path is not a list, num_mixes must not be None: {}'.format(
+                    dataset))
+          stem_p = p | 'tfrecord_list_%s_%d' % (dataset.name, source_id) >> (
+              beam.Create(data.generate_sharded_filenames(stem_path)))
+          stem_p |= 'read_tfrecord_%s_%d' % (dataset.name, source_id) >> (
+              beam.io.tfrecordio.ReadAllFromTFRecord(
+                  coder=beam.coders.ProtoCoder(tf.train.Example)))
+          # Key all examples with a hash.
+          def key_example(ex, source_id):
+            # prefixing the hash with the source_id is critical because the same
+            # dataset may be present multiple times and we want unique ids for
+            # each entry.
+            return (
+                '{}-{}'.format(
+                    source_id,
+                    hashlib.sha256(ex.SerializeToString()).hexdigest()),
+                ex)
+          stem_p |= 'add_id_key_%s_%d' % (dataset.name, source_id) >> (
+              beam.Map(key_example, source_id=source_id))
+          id_exs.append(stem_p)
+
+          # Create a list of source_id to example id.
+          def sourceid_to_exid(id_ex, source_id):
+            return (source_id, id_ex[0])
+          sourceid_to_exids.append(
+              stem_p | 'key_%s_%d' % (dataset.name, source_id) >> (
+                  beam.Map(sourceid_to_exid, source_id=source_id)))
+        id_exs = id_exs | 'id_exs_flatten_%s' % dataset.name >> beam.Flatten()
+        sourceid_to_exids = (
+            sourceid_to_exids | 'sourceid_to_exids_flatten_%s' % dataset.name >>
+            beam.Flatten())
+        # Pass the list of source id to example IDs to generate_mixes,
+        # which will create mixes by selecting random IDs from each source
+        # (with replacement). This is represented as a list of example IDs
+        # to Mix IDs.
+        # Note: beam.Create([0]) is just a single dummy value to allow the
+        # sourceid_to_exids to be passed in as a python list so we can do the
+        # sampling with numpy.
+        exid_to_mixids = (
+            p
+            | 'create_dummy_%s' % dataset.name >> beam.Create([0])
+            | 'generate_mixes_%s' % dataset.name >> beam.Map(
+                generate_mixes, num_mixes=dataset.num_mixes,
+                sourceid_to_exids=beam.pvalue.AsList(sourceid_to_exids)))
+        # Create a list of (Mix ID, Full Example proto). Note: Examples may be
+        # present in more than one mix. Then, group by Mix ID.
+        def mixid_to_exs(id_ex, exid_to_mixids):
+          exid, ex = id_ex
+          for mixid in exid_to_mixids[exid]:
+            yield mixid, ex
+        mixid_exs = (
+            id_exs
+            | 'mixid_to_exs_%s' % dataset.name >> beam.FlatMap(
+                mixid_to_exs,
+                exid_to_mixids=beam.pvalue.AsSingleton(exid_to_mixids))
+            | 'group_by_key_%s' % dataset.name >> beam.GroupByKey())
+        # Take these groups of Examples, mix their audio and sequences to return
+        # a single new Example. Then, carry on with the rest of the pipeline
+        # like normal.
+        split_p = (
+            mixid_exs
+            | 'mix_examples_%s' % dataset.name >> beam.Map(
+                mix_examples, FLAGS.sample_rate, FLAGS.load_audio_with_librosa))
+      else:
+        if dataset.num_mixes is not None:
+          raise ValueError(
+              'If path is not a list, num_mixes must be None: {}'.format(
+                  dataset))
+        split_p = p | 'tfrecord_list_%s' % dataset.name >> beam.Create(
+            data.generate_sharded_filenames(dataset.path))
+        split_p |= 'read_tfrecord_%s' % dataset.name >> (
+            beam.io.tfrecordio.ReadAllFromTFRecord(
+                coder=beam.coders.ProtoCoder(tf.train.Example)))
       split_p |= 'shuffle_input_%s' % dataset.name >> beam.Reshuffle()
       split_p |= 'split_wav_%s' % dataset.name >> beam.FlatMap(
-          split_wav, FLAGS.min_length, FLAGS.max_length, FLAGS.sample_rate,
-          FLAGS.output_directory, dataset.process_for_training,
-          FLAGS.load_audio_with_librosa)
+          split_wav, min_length=FLAGS.min_length, max_length=FLAGS.max_length,
+          sample_rate=FLAGS.sample_rate,
+          debug_output_directory=FLAGS.output_directory,
+          split_example=dataset.process_for_training,
+          load_audio_with_librosa=FLAGS.load_audio_with_librosa)
       if FLAGS.preprocess_examples:
         if dataset.process_for_training:
           mul_name = 'preprocess_multiply_%dx_%s' % (
@@ -245,7 +326,8 @@ def pipeline(config_map, dataset_config_map):
           split_p |= mul_name >> beam.FlatMap(
               multiply_example, FLAGS.preprocess_train_example_multiplier)
         split_p |= 'preprocess_%s' % dataset.name >> beam.Map(
-            preprocess_data, hparams, dataset.process_for_training)
+            preprocess_data, preprocess_example_fn, input_tensors_to_example_fn,
+            hparams, dataset.process_for_training)
       split_p |= 'shuffle_output_%s' % dataset.name >> beam.Reshuffle()
       split_p |= 'write_%s' % dataset.name >> beam.io.WriteToTFRecord(
           os.path.join(FLAGS.output_directory, '%s.tfrecord' % dataset.name),

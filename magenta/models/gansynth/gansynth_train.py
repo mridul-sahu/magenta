@@ -55,7 +55,6 @@ import tensorflow as tf
 absl.flags.DEFINE_string('hparams', '{}', 'Flags dict as JSON string.')
 absl.flags.DEFINE_string('config', '', 'Name of config module.')
 FLAGS = absl.flags.FLAGS
-tfgan = tf.contrib.gan
 tf.logging.set_verbosity(tf.logging.INFO)
 
 
@@ -85,7 +84,7 @@ def run(config):
 
   stage_ids = train_util.get_stage_ids(**config)
   if not config['train_progressive']:
-    stage_ids = stage_ids[-1:]
+    stage_ids = list(stage_ids)[-1:]
 
   # Train one stage at a time
   for stage_id in stage_ids:

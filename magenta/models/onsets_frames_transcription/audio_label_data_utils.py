@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""Utilities for splitting wav files and labels into smaller chunks."""
+r"""Utilities for managing wav files and labels for transcription."""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -24,6 +24,7 @@ import math
 import librosa
 
 from magenta.music import audio_io
+from magenta.music import constants
 from magenta.music import sequences_lib
 from magenta.protobuf import music_pb2
 
@@ -210,6 +211,10 @@ def create_example(example_id, ns, wav_data, velocity_range=None):
     velocity_min = np.min(velocities)
     velocity_range = music_pb2.VelocityRange(min=velocity_min, max=velocity_max)
 
+  # Ensure that all sequences for training and evaluation have gone through
+  # sustain processing.
+  sus_ns = sequences_lib.apply_sustain_control_changes(ns)
+
   example = tf.train.Example(
       features=tf.train.Features(
           feature={
@@ -220,7 +225,7 @@ def create_example(example_id, ns, wav_data, velocity_range=None):
               'sequence':
                   tf.train.Feature(
                       bytes_list=tf.train.BytesList(
-                          value=[ns.SerializeToString()])),
+                          value=[sus_ns.SerializeToString()])),
               'audio':
                   tf.train.Feature(
                       bytes_list=tf.train.BytesList(value=[wav_data])),
@@ -301,3 +306,61 @@ def process_record(wav_data,
     new_wav_data = audio_io.samples_to_wav_data(new_samples, sample_rate)
     yield create_example(
         example_id, new_ns, new_wav_data, velocity_range=velocity_range)
+
+
+def mix_sequences(individual_samples, sample_rate, individual_sequences):
+  """Mix multiple audio/notesequence pairs together.
+
+  All sequences will be repeated until they are as long as the longest sequence.
+
+  Note that the mixed sequence will contain only the (sustain-processed) notes
+  from the individual sequences. All other control changes and metadata will not
+  be preserved.
+
+  Args:
+    individual_samples: A list of audio samples to mix.
+    sample_rate: Rate at which to interpret the samples
+    individual_sequences: A list of NoteSequences to mix.
+
+  Returns:
+    mixed_samples: The mixed audio.
+    mixed_sequence: The mixed NoteSequence.
+  """
+  # Ensure that samples are always at least as long as their paired sequences.
+  for i, (samples, sequence) in enumerate(
+      zip(individual_samples, individual_sequences)):
+    if len(samples) / sample_rate < sequence.total_time:
+      padding = int(math.ceil(
+          (sequence.total_time - len(samples) / sample_rate) * sample_rate))
+      individual_samples[i] = np.pad(samples, [0, padding], 'constant')
+
+  # Repeat each ns/wav pair to be as long as the longest wav.
+  max_duration = np.max([len(s) for s in individual_samples]) / sample_rate
+
+  extended_samples = []
+  extended_sequences = []
+  for samples, sequence in zip(individual_samples, individual_sequences):
+    extended_samples.append(
+        audio_io.repeat_samples_to_duration(samples, sample_rate, max_duration))
+    extended_sequences.append(
+        sequences_lib.repeat_sequence_to_duration(
+            sequence, max_duration,
+            sequence_duration=len(samples) / sample_rate))
+
+  # Mix samples and sequences together
+  mixed_samples = np.zeros_like(extended_samples[0])
+  for samples in extended_samples:
+    mixed_samples += samples / len(extended_samples)
+
+  mixed_sequence = music_pb2.NoteSequence()
+  mixed_sequence.ticks_per_quarter = constants.STANDARD_PPQ
+  del mixed_sequence.notes[:]
+  for sequence in extended_sequences:
+    # Process sustain changes before copying notes.
+    sus_sequence = sequences_lib.apply_sustain_control_changes(sequence)
+    if sus_sequence.total_time > mixed_sequence.total_time:
+      mixed_sequence.total_time = sus_sequence.total_time
+    # TODO(fjord): Manage instrument/program numbers.
+    mixed_sequence.notes.extend(sus_sequence.notes)
+
+  return mixed_samples, mixed_sequence

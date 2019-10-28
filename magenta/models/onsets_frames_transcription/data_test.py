@@ -130,8 +130,10 @@ class DataTest(tf.test.TestCase):
       dataset = data.provide_batch(
           examples=examples,
           preprocess_examples=True,
-          hparams=hparams,
-          is_training=False)
+          params=hparams,
+          is_training=False,
+          shuffle_examples=False,
+          skip_n_initial_records=0)
       iterator = dataset.make_initializable_iterator()
       next_record = iterator.get_next()
       sess.run([
@@ -281,6 +283,27 @@ class DataTest(tf.test.TestCase):
         batch_size=2,
         lengths=[10, 50, 100, 10, 50, 80],
         expected_num_inputs=6)
+
+  def testGeneratedShardedFilenamesCommaWithShard(self):
+    filenames = data.generate_sharded_filenames('/foo/bar@3,/baz/qux@2')
+    self.assertEqual(
+        [
+            '/foo/bar-00000-of-00003',
+            '/foo/bar-00001-of-00003',
+            '/foo/bar-00002-of-00003',
+            '/baz/qux-00000-of-00002',
+            '/baz/qux-00001-of-00002',
+        ],
+        filenames)
+
+  def testGeneratedShardedFilenamesCommaWithoutShard(self):
+    filenames = data.generate_sharded_filenames('/foo/bar,/baz/qux')
+    self.assertEqual(
+        [
+            '/foo/bar',
+            '/baz/qux',
+        ],
+        filenames)
 
 
 if __name__ == '__main__':
